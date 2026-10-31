@@ -64,6 +64,15 @@ $sc.WorkingDirectory = $here
 $sc.Description = "肥鱼输入器：语音输入 + 截图翻译"
 $sc.Save()
 
+# 看门狗：主程序被意外结束时 60 秒内自动拉起
+$wd = Join-Path ([Environment]::GetFolderPath('Startup')) "肥鱼输入器-看门狗.lnk"
+$sc2 = $wsh.CreateShortcut($wd)
+$sc2.TargetPath = "wscript.exe"
+$sc2.Arguments = "`"$here\watchdog.vbs`""
+$sc2.WorkingDirectory = $here
+$sc2.Description = "肥鱼输入器看门狗"
+$sc2.Save()
+
 Get-Process pythonw -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 500
 $r = ([wmiclass]"Win32_Process").Create("wscript.exe `"$here\start.vbs`"")

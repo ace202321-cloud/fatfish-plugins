@@ -123,6 +123,7 @@ class App:
     def start_record(self):
         try:
             self.summon_bar()
+            self.bar.set_mode('full')   # 热键唤出时直接展开，看得见状态
             self.focus_hwnd = user32.GetForegroundWindow()
             self.recorder.start()
             self.state = "recording"

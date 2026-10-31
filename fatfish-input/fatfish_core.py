@@ -33,16 +33,15 @@ DEFAULTS = {
     "hotkey_shot": "Win+Shift+X",
     "hotkey_lang": "Win+Shift+L",
     "target_lang": "中文",
-    "asr_model_dir": str(APP_DIR / "models" / "asr-paraformer-zh"),
-    "api_key": "",
-    "api_key_file": "",
+    "asr_model_dir": r"C:\Users\Lenovo\.dsh\toolkits\video-kit\models\asr-paraformer-zh",
+    "api_key_file": r"C:\Users\Lenovo\.dsh\crosspost\secrets\deepseek-key.txt",
     "api_model": "deepseek-flash",
     "silence_ms": 700,
     "max_record_ms": 20000,
     "auto_paste": True,
     "translate_voice": "auto",
     "mt_engine": "auto",              # auto / online / offline
-    "nllb_dir": str(APP_DIR / "models" / "nllb-200-600M"),
+    "nllb_dir": r"C:\Users\Lenovo\.dsh\toolkits\fatfish-nllb",
     "bar_x": -1,
     "bar_y": -1,
 }
@@ -155,21 +154,13 @@ _conn_lock = threading.Lock()
 
 
 def read_api_key():
-    """优先 config.json 的 api_key，其次 DEEPSEEK_API_KEY 环境变量，最后 api_key_file。"""
-    k = (CFG.get("api_key") or "").strip()
-    if k.startswith("sk-"):
-        return k
-    k = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
-    if k.startswith("sk-"):
-        return k
-    f = CFG.get("api_key_file") or ""
-    if f:
-        p = Path(f)
-        if p.exists():
-            for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
-                line = line.strip()
-                if line.startswith("sk-"):
-                    return line
+    p = Path(CFG["api_key_file"])
+    if not p.exists():
+        return None
+    for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if line.startswith("sk-"):
+            return line
     return None
 
 
