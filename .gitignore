@@ -1,0 +1,13 @@
+# 运行产物
+__pycache__/
+*.pyc
+fatfish_input.log
+_last.wav
+shots/
+.detached_mark
+
+# 用户数据
+config.json
+
+# 模型（自己下载，不入库）
+models/
