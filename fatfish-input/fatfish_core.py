@@ -348,70 +348,82 @@ def asr_wav(path):
 
 # ------------------------------------------------------------------ 录音（可主动停止 + 电平）
 class Recorder:
-    """麦克风录音。
+    """麦克风录音（Windows WASAPI / soundcard），采集线程常驻。
 
-    ⚠️ 关键修复：以前每次录音都 sd.InputStream(...) 新建 + close()，
-       PortAudio 在某些驱动上反复 open/close 会直接崩（0xc0000005，
-       崩在 libportaudio64bit.dll），表现就是"程序用着用着没了"。
-       现在流**只创建一次**，录音时 start/stop，闲置 10 分钟才关掉释放麦克风。
+    为什么换掉 PortAudio：旧实现每次录音都 open/close 音频流，会崩在
+    libportaudio64bit.dll（0xc0000005），整个进程消失 —— 表现为"按热键只打出 h"。
+    现在 WASAPI 线程全程常驻，不关不重开，只在"要不要收数据"上做开关。
     """
     RATE = 16000
-    BLOCK = 1600          # 100ms 一块
+    BLOCK = 1600          # 100ms
 
     def __init__(self, on_level=None, on_auto_stop=None):
-        self.stream = None
-        self.chunks = []
         self.on_level = on_level
         self.on_auto_stop = on_auto_stop
+        self.chunks = []
         self.recording = False
         self.started_at = 0.0
         self.last_voice = 0.0
         self._lock = threading.Lock()
-        self._idle_since = 0.0
+        self._thread = None
+        self._alive = False
+        self._mic = None
+        self._rec = None
+        self._fail = 0
 
-    # ---------- 流管理
-    def _open(self):
-        import sounddevice as sd
-        st = sd.InputStream(samplerate=self.RATE, channels=1, dtype="float32",
-                            blocksize=self.BLOCK, callback=self._cb)
-        st.start()
-        self.stream = st
-        self._idle_since = 0.0
-
-    def _ensure_stream(self):
-        if self.stream is not None:
-            try:
-                if not self.stream.active:
-                    self.stream.start()
-                return
-            except Exception as e:
-                log("音频流异常 %r，重建" % (e,))
-                try:
-                    self.stream.close()
-                except Exception:
-                    pass
-                self.stream = None
-        self._open()
-
-    def close(self):
+    # ---------- 采集线程
+    def _drop_rec(self):
         try:
-            if self.stream is not None:
-                self.stream.stop()
-                self.stream.close()
+            if self._rec is not None:
+                self._rec.__exit__(None, None, None)
         except Exception:
             pass
-        self.stream = None
+        self._rec = None
 
-    # ---------- 回调
-    def _cb(self, indata, frames, t, status):
+    def _loop(self):
+        while self._alive:
+            try:
+                if self._rec is None:
+                    import soundcard as sc
+                    self._mic = sc.default_microphone()
+                    self._rec = self._mic.recorder(samplerate=self.RATE, channels=1)
+                    self._rec.__enter__()
+                    self._fail = 0
+                    log("麦克风已就绪（WASAPI）")
+                data = self._rec.record(numframes=self.BLOCK)
+                self._on_block(data)
+            except Exception as e:
+                if not self._alive:
+                    break
+                self._fail += 1
+                if self._fail <= 5 or self._fail % 30 == 0:
+                    log("WASAPI 采集异常 %r（第 %d 次）" % (e, self._fail))
+                self._drop_rec()
+                time.sleep(min(3.0, 0.4 * self._fail))
+        self._drop_rec()
+
+    def _ensure_thread(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._alive = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _on_block(self, data):
         if not self.recording:
             return
         import numpy as np
+        arr = np.asarray(data, dtype="float32")
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
         with self._lock:
-            self.chunks.append(indata.copy())
-        rms = float(np.sqrt(np.mean(indata ** 2)))
+            self.chunks.append(arr.copy())
+        try:
+            rms = float(np.sqrt(np.mean(arr ** 2)))
+        except Exception:
+            return
         now = time.time()
-        if rms > 0.012:                 # 有声音 → 重新计时
+        if rms > 0.012:
             self.last_voice = now
         if self.on_level:
             try:
@@ -422,7 +434,7 @@ class Recorder:
         dur = now - self.started_at
         if (silence >= CFG["silence_ms"] / 1000.0 and dur > 0.8) or \
            dur >= CFG["max_record_ms"] / 1000.0:
-            self.recording = False      # 先关，避免重复触发
+            self.recording = False
             if self.on_auto_stop:
                 try:
                     self.on_auto_stop()
@@ -431,23 +443,17 @@ class Recorder:
 
     # ---------- 对外
     def start(self):
-        self._ensure_stream()
+        self._ensure_thread()
         with self._lock:
             self.chunks = []
         self.started_at = time.time()
-        self.last_voice = self.started_at      # 从按下开始算静默时间
+        self.last_voice = self.started_at
         self.recording = True
         log("录音开始（静默 %.0f 秒自动结束）" % (CFG["silence_ms"] / 1000.0))
 
     def stop(self, out_wav):
         self.recording = False
-        time.sleep(0.06)                       # 等回调把最后一块收进来
-        if self.stream is not None:
-            try:
-                self.stream.stop()             # 只 stop，不 close（避免崩溃）
-            except Exception:
-                pass
-            self._idle_since = time.time()
+        time.sleep(0.15)
         import numpy as np, wave
         with self._lock:
             chunks = list(self.chunks)
@@ -459,14 +465,17 @@ class Recorder:
             w.writeframes((audio * 32767).astype(np.int16).tobytes())
         return out_wav
 
+    def close(self):
+        self._alive = False
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout=2.0)
+        self._drop_rec()
+        self._thread = None
+
     def release_if_idle(self, idle_sec=600):
-        """闲置太久就把流关掉，释放麦克风（避免系统一直显示麦克风占用）。"""
-        if self.stream is None or self.recording or not self._idle_since:
-            return
-        if time.time() - self._idle_since > idle_sec:
-            self.close()
-            self._idle_since = 0.0
-            log("麦克风已释放（闲置）")
+        # 采集线程常驻，不做关闭/重开（这台机器上重开 WASAPI 会持续失败）
+        return
 
 
 # ------------------------------------------------------------------ 粘贴

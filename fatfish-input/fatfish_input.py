@@ -411,8 +411,11 @@ class App:
         log("=== v4 启动 === job=%s" % _in_any_job())
         if _in_any_job() and _respawn_detached_and_exit():
             return
+        import atexit
+        atexit.register(lambda: log("进程正常退出(atexit)"))
+        self.root.after(120000, self._heartbeat)
         self.root.after(25000, self._asr_preload_after_start)
-        self.root.after(300000, self._idle_release_mic)
+        self.root.after(30000, self._idle_release_mic)
         self.root.mainloop()
 
     def _asr_preload_after_start(self):
@@ -440,13 +443,24 @@ class App:
                 log("ASR 预热失败 %r" % (e,))
         threading.Thread(target=work, daemon=True).start()
 
+    def _heartbeat(self):
+        """每 2 分钟一条心跳：进程若无声消失，日志能看出大概时间点。"""
+        try:
+            log("心跳 state=%s" % self.state)
+        except Exception:
+            pass
+        try:
+            self.root.after(120000, self._heartbeat)
+        except Exception:
+            pass
+
     def _idle_release_mic(self):
         """每 5 分钟检查一次：闲置太久就把麦克风流关掉，释放麦克风占用。"""
         try:
-            self.rec.release_if_idle(600)
+            self.recorder.release_if_idle(120)
         except Exception as e:
             log("idle release err %r" % (e,))
-        self.root.after(300000, self._idle_release_mic)
+        self.root.after(30000, self._idle_release_mic)
 
 
 if __name__ == "__main__":
