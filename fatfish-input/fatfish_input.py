@@ -14,6 +14,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fatfish_core as core
 import fatfish_ui as ui
 from fatfish_ui import px
+
+# ---------------- 原生崩溃日志（PortAudio 之类崩在 C 层也能留证据）----------------
+import faulthandler as _faulthandler
+try:
+    _crash_fp = open(str(Path(__file__).resolve().parent / "crash.log"), "a", encoding="utf-8")
+    _faulthandler.enable(file=_crash_fp, all_threads=True)
+except Exception:
+    pass
+
+
+def _single_instance():
+    """同名互斥体：已经有一个实例在跑就直接退出，避免两个实例抢热键。"""
+    try:
+        k = ctypes.windll.kernel32
+        k.CreateMutexW(None, False, "Global\\FatFishInputSingleton")
+        if k.GetLastError() == 183:      # ERROR_ALREADY_EXISTS
+            return False
+    except Exception:
+        pass
+    return True
+
 from fatfish_core import CFG, LANGS, log, save_cfg
 
 user32 = core.user32
@@ -103,10 +124,9 @@ class App:
             self.q.put("stop")
             return
         if self.state == "busy":
-            # 上一轮卡住了（比如结果卡渲染失败）→ 强制作废，让用户能重新按
-            log("busy 卡住 → 强制复位并重新开始")
-            self.state = "idle"
-            self.bar.set_state("idle")
+            # 正在识别/翻译上一条：忽略，别把上一句弄丢
+            log("busy：上一条还在处理，本次忽略")
+            return
         self.q.put("start")
 
     def cfg_voice_hint(self):
@@ -310,16 +330,34 @@ class App:
         hwnd = user32.CreateWindowExW(0, "STATIC", "ffv3", 0, 0, 0, 0, 0, None, None, None, None)
         mapping = [("start_stop", CFG["hotkey_voice"]), ("shot", CFG["hotkey_shot"]),
                    ("lang", CFG["hotkey_lang"])]
-        for hid, (name, spec) in enumerate(mapping, start=1):
+        MOD_NOREPEAT = 0x4000
+
+        def parse(spec):
             mods, vk = 0, 0
             for part in str(spec).replace("+", " ").split():
-                p = part.strip().lower()
+                q = part.strip().lower()
                 mods |= {"win": core.MOD_WIN, "shift": core.MOD_SHIFT,
-                         "ctrl": core.MOD_CONTROL, "alt": core.MOD_ALT}.get(p, 0)
-                if len(p) == 1:
-                    vk = ord(p.upper())
-            ok = user32.RegisterHotKey(hwnd, hid, mods, vk)
-            log("热键 %s(%s) -> %s" % (name, spec, "ok" if ok else "FAILED"))
+                         "ctrl": core.MOD_CONTROL, "alt": core.MOD_ALT}.get(q, 0)
+                if len(q) == 1:
+                    vk = ord(q.upper())
+            return mods | MOD_NOREPEAT, vk
+
+        ids = {name: i + 1 for i, (name, _) in enumerate(mapping)}
+        # 注册热键；失败最多重试 6 次（每 5 秒），避免"一开机被别人占了就永远没反应"
+        pending = list(mapping)
+        for attempt in range(6):
+            still = []
+            for name, spec in pending:
+                mods, vk = parse(spec)
+                ok = user32.RegisterHotKey(hwnd, ids[name], mods, vk)
+                log("热键 %s(%s) -> %s%s" % (name, spec, "ok" if ok else "FAILED",
+                                            "" if attempt == 0 else " (第%d次重试)" % attempt))
+                if not ok:
+                    still.append((name, spec))
+            pending = still
+            if not pending:
+                break
+            time.sleep(5)
 
         class MSG(ctypes.Structure):
             _fields_ = [("hwnd", wt.HWND), ("message", wt.UINT), ("wParam", wt.WPARAM),
@@ -373,7 +411,42 @@ class App:
         log("=== v4 启动 === job=%s" % _in_any_job())
         if _in_any_job() and _respawn_detached_and_exit():
             return
+        self.root.after(25000, self._asr_preload_after_start)
+        self.root.after(300000, self._idle_release_mic)
         self.root.mainloop()
+
+    def _asr_preload_after_start(self):
+        """启动 25 秒后后台预热语音模型：内存够（>3.5GB 可用）才预热，否则等第一次用。"""
+        def work():
+            try:
+                os_ok = False
+                try:
+                    import ctypes as _c
+                    class _MS(ctypes.Structure):
+                        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+                    ms = _MS(); ms.dwLength = ctypes.sizeof(_MS)
+                    _c.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+                    os_ok = ms.ullAvailPhys > 3_500_000_000
+                except Exception:
+                    os_ok = True
+                if os_ok:
+                    core.asr_preload()
+                    log("ASR 预热完成")
+            except Exception as e:
+                log("ASR 预热失败 %r" % (e,))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _idle_release_mic(self):
+        """每 5 分钟检查一次：闲置太久就把麦克风流关掉，释放麦克风占用。"""
+        try:
+            self.rec.release_if_idle(600)
+        except Exception as e:
+            log("idle release err %r" % (e,))
+        self.root.after(300000, self._idle_release_mic)
 
 
 if __name__ == "__main__":
@@ -385,4 +458,7 @@ if __name__ == "__main__":
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+    if not _single_instance():
+        log("已有实例在运行（互斥体已存在），本进程直接退出")
+        raise SystemExit(0)
     App().run()

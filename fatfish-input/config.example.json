@@ -1,14 +1,14 @@
 {
-  "hotkey_voice": "Win+Shift+H",
-  "hotkey_shot": "Win+Shift+X",
-  "hotkey_lang": "Win+Shift+L",
-  "target_lang": "中文",
-  "api_key": "",
-  "api_model": "deepseek-flash",
-  "silence_ms": 700,
-  "max_record_ms": 20000,
-  "auto_paste": true,
-  "mt_engine": "online",
-  "bar_x": -1,
-  "bar_y": -1
+    "hotkey_voice":  "Win+Shift+H",
+    "hotkey_shot":  "Win+Shift+X",
+    "hotkey_lang":  "Win+Shift+L",
+    "target_lang":  "中文",
+    "api_key":  "",
+    "api_model":  "deepseek-flash",
+    "silence_ms":  10000,
+    "max_record_ms":  60000,
+    "auto_paste":  true,
+    "mt_engine":  "online",
+    "bar_x":  -1,
+    "bar_y":  -1
 }

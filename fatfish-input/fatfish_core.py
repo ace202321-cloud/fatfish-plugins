@@ -348,65 +348,125 @@ def asr_wav(path):
 
 # ------------------------------------------------------------------ 录音（可主动停止 + 电平）
 class Recorder:
+    """麦克风录音。
+
+    ⚠️ 关键修复：以前每次录音都 sd.InputStream(...) 新建 + close()，
+       PortAudio 在某些驱动上反复 open/close 会直接崩（0xc0000005，
+       崩在 libportaudio64bit.dll），表现就是"程序用着用着没了"。
+       现在流**只创建一次**，录音时 start/stop，闲置 10 分钟才关掉释放麦克风。
+    """
+    RATE = 16000
+    BLOCK = 1600          # 100ms 一块
+
     def __init__(self, on_level=None, on_auto_stop=None):
         self.stream = None
         self.chunks = []
         self.on_level = on_level
         self.on_auto_stop = on_auto_stop
-        self.stop_flag = threading.Event()
-        self.started_at = 0
-        self.spoke = False
-        self.silence_blocks = 0
+        self.recording = False
+        self.started_at = 0.0
+        self.last_voice = 0.0
         self._lock = threading.Lock()
+        self._idle_since = 0.0
 
-    def start(self):
+    # ---------- 流管理
+    def _open(self):
         import sounddevice as sd
-        self.chunks = []
-        self.stop_flag.clear()
-        self.started_at = time.time()
-        self.spoke = False
-        self.silence_blocks = 0
+        st = sd.InputStream(samplerate=self.RATE, channels=1, dtype="float32",
+                            blocksize=self.BLOCK, callback=self._cb)
+        st.start()
+        self.stream = st
+        self._idle_since = 0.0
 
-        def cb(indata, frames, t, status):
-            with self._lock:
-                self.chunks.append(indata.copy())
-            import numpy as np
-            rms = float(np.sqrt(np.mean(indata ** 2)))
-            if self.on_level:
-                self.on_level(rms)
-            if rms > 0.012:
-                self.spoke = True
-                self.silence_blocks = 0
-            else:
-                self.silence_blocks += 1
-                sil_ms = self.silence_blocks * 100
-                dur_ms = (time.time() - self.started_at) * 1000
-                if (self.spoke and sil_ms >= CFG["silence_ms"]) or dur_ms >= CFG["max_record_ms"]:
-                    if self.on_auto_stop:
-                        self.on_auto_stop()
+    def _ensure_stream(self):
+        if self.stream is not None:
+            try:
+                if not self.stream.active:
+                    self.stream.start()
+                return
+            except Exception as e:
+                log("音频流异常 %r，重建" % (e,))
+                try:
+                    self.stream.close()
+                except Exception:
+                    pass
+                self.stream = None
+        self._open()
 
-        self.stream = sd.InputStream(samplerate=16000, channels=1, dtype="float32",
-                                     blocksize=1600, callback=cb)
-        self.stream.start()
-
-    def stop(self, out_wav):
+    def close(self):
         try:
-            if self.stream:
+            if self.stream is not None:
                 self.stream.stop()
                 self.stream.close()
-        finally:
-            self.stream = None
+        except Exception:
+            pass
+        self.stream = None
+
+    # ---------- 回调
+    def _cb(self, indata, frames, t, status):
+        if not self.recording:
+            return
         import numpy as np
-        import wave
+        with self._lock:
+            self.chunks.append(indata.copy())
+        rms = float(np.sqrt(np.mean(indata ** 2)))
+        now = time.time()
+        if rms > 0.012:                 # 有声音 → 重新计时
+            self.last_voice = now
+        if self.on_level:
+            try:
+                self.on_level(rms)
+            except Exception:
+                pass
+        silence = now - self.last_voice
+        dur = now - self.started_at
+        if (silence >= CFG["silence_ms"] / 1000.0 and dur > 0.8) or \
+           dur >= CFG["max_record_ms"] / 1000.0:
+            self.recording = False      # 先关，避免重复触发
+            if self.on_auto_stop:
+                try:
+                    self.on_auto_stop()
+                except Exception:
+                    pass
+
+    # ---------- 对外
+    def start(self):
+        self._ensure_stream()
+        with self._lock:
+            self.chunks = []
+        self.started_at = time.time()
+        self.last_voice = self.started_at      # 从按下开始算静默时间
+        self.recording = True
+        log("录音开始（静默 %.0f 秒自动结束）" % (CFG["silence_ms"] / 1000.0))
+
+    def stop(self, out_wav):
+        self.recording = False
+        time.sleep(0.06)                       # 等回调把最后一块收进来
+        if self.stream is not None:
+            try:
+                self.stream.stop()             # 只 stop，不 close（避免崩溃）
+            except Exception:
+                pass
+            self._idle_since = time.time()
+        import numpy as np, wave
         with self._lock:
             chunks = list(self.chunks)
         audio = np.concatenate(chunks, axis=0) if chunks else np.zeros((0, 1), dtype="float32")
         with wave.open(str(out_wav), "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
-            w.setframerate(16000)
+            w.setframerate(self.RATE)
             w.writeframes((audio * 32767).astype(np.int16).tobytes())
         return out_wav
+
+    def release_if_idle(self, idle_sec=600):
+        """闲置太久就把流关掉，释放麦克风（避免系统一直显示麦克风占用）。"""
+        if self.stream is None or self.recording or not self._idle_since:
+            return
+        if time.time() - self._idle_since > idle_sec:
+            self.close()
+            self._idle_since = 0.0
+            log("麦克风已释放（闲置）")
 
 
 # ------------------------------------------------------------------ 粘贴
